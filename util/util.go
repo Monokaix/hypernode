@@ -37,6 +37,17 @@ func InitClient(kubeConfig string) (*vcclientset.Clientset, error) {
 	return vcClient, nil
 }
 
+func GetMembers(list []string, memberType topologyv1alpha1.MemberType) []topologyv1alpha1.MemberSpec {
+	members := make([]topologyv1alpha1.MemberSpec, len(list))
+	for i, name := range list {
+		members[i] = topologyv1alpha1.MemberSpec{
+			Type:     memberType,
+			Selector: topologyv1alpha1.MemberSelector{ExactMatch: &topologyv1alpha1.ExactMatch{Name: name}},
+		}
+	}
+	return members
+}
+
 func BuildHyperNode(name string, tier int, Members []topologyv1alpha1.MemberSpec) *topologyv1alpha1.HyperNode {
 	return &topologyv1alpha1.HyperNode{
 		TypeMeta: v1.TypeMeta{

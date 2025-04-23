@@ -31,31 +31,40 @@ type UFMInterface struct {
 	PeerNodeName    string `json:"peer_node_name"`
 }
 
+// LeafSwitch represents each single leaf switch.
 type LeafSwitch struct {
-	Name         string
-	Tier         int
-	NodeNames    sets.Set[string]
-	CommonPrefix string
+	Name string
+	Tier int
+	// NodeNames the real computer node name list in a single leaf switch.
+	NodeNames sets.Set[string]
+}
+
+// LeafSwitchesGroup represents a group of leaf switches which are connected.
+type LeafSwitchesGroup struct {
+	Leafs map[string]LeafSwitch
+	// NodeList the real computer node name list in a grouped leaf switches.
+	NodeNames sets.Set[string]
 }
 
 func getLeafSwitches(ufmData []UFMInterface) []LeafSwitch {
 	leafMap := make(map[string]*LeafSwitch)
 
 	for _, data := range ufmData {
+		// Only need to parse computer ufm data because it containers both leaf and computer connection information.
+		if !strings.Contains(data.Description, "Computer") {
+			continue
+		}
 		leafName := data.PeerNodeName
 		nodeName := data.SystemName
-		nodeDesc := data.NodeDescription
 
 		if _, exists := leafMap[leafName]; !exists {
 			leafMap[leafName] = &LeafSwitch{
-				Name:         leafName,
-				Tier:         data.Tier,
-				NodeNames:    sets.New[string](nodeName),
-				CommonPrefix: nodeDesc,
+				Name:      leafName,
+				Tier:      data.Tier,
+				NodeNames: sets.New[string](nodeName),
 			}
 		} else {
 			leafMap[leafName].NodeNames.Insert(nodeName)
-			leafMap[leafName].CommonPrefix = util.CommonPrefix([]string{leafMap[leafName].CommonPrefix, nodeDesc})
 		}
 	}
 
@@ -67,7 +76,9 @@ func getLeafSwitches(ufmData []UFMInterface) []LeafSwitch {
 	return result
 }
 
-func classifyLeafs(leafSwitches []LeafSwitch) map[string]map[string]LeafSwitch {
+// classifyLeafs classifies leaf switches into groups,
+// groupID -> LeafSwitchesGroup
+func classifyLeafs(leafSwitches []LeafSwitch) map[string]LeafSwitchesGroup {
 	leafMap := make(map[string]LeafSwitch)
 	for _, leaf := range leafSwitches {
 		leafMap[leaf.Name] = leaf
@@ -88,7 +99,7 @@ func classifyLeafs(leafSwitches []LeafSwitch) map[string]map[string]LeafSwitch {
 		}
 	}
 
-	leafGroups := make(map[string]map[string]LeafSwitch)
+	leafGroups := make(map[string]LeafSwitchesGroup)
 	groupID := 0
 	processedLeafs := sets.New[string]()
 
@@ -103,7 +114,10 @@ func classifyLeafs(leafSwitches []LeafSwitch) map[string]map[string]LeafSwitch {
 
 		// Use BFS to Find All Connected Leaf Nodes
 		queue := []string{leaf}
-		leafGroup := make(map[string]LeafSwitch)
+		leafGroup := LeafSwitchesGroup{
+			Leafs:     make(map[string]LeafSwitch),
+			NodeNames: sets.New[string](),
+		}
 
 		for len(queue) > 0 {
 			currentLeaf := queue[0]
@@ -113,7 +127,8 @@ func classifyLeafs(leafSwitches []LeafSwitch) map[string]map[string]LeafSwitch {
 				continue
 			}
 
-			leafGroup[currentLeaf] = leafMap[currentLeaf]
+			leafGroup.Leafs[currentLeaf] = leafMap[currentLeaf]
+			leafGroup.NodeNames.Insert(leafMap[currentLeaf].NodeNames.UnsortedList()...)
 			processedLeafs.Insert(currentLeaf)
 
 			// Find all other leaf nodes that have common nodes with the current leaf node
@@ -132,7 +147,7 @@ func classifyLeafs(leafSwitches []LeafSwitch) map[string]map[string]LeafSwitch {
 	return leafGroups
 }
 
-func LeafSwitchesGroups(ufmData []UFMInterface) map[string]map[string]LeafSwitch {
+func LeafSwitchesGroups(ufmData []UFMInterface) map[string]LeafSwitchesGroup {
 	leafSwitches := getLeafSwitches(ufmData)
 	leafSwitchesGroups := classifyLeafs(leafSwitches)
 	return leafSwitchesGroups
@@ -175,29 +190,19 @@ func main() {
 	buildAndCreateHyperNode(vcClient, leafSwitches)
 }
 
-func buildAndCreateHyperNode(client vcclientset.Interface, leafSwitches map[string]map[string]LeafSwitch) {
+func buildAndCreateHyperNode(client vcclientset.Interface, leafSwitches map[string]LeafSwitchesGroup) {
 	leafHyperNodeNames := make([]string, 0, len(leafSwitches))
 	for groupID, leafs := range leafSwitches {
-		prefix := ""
 		klog.InfoS("LeafSwitches groups", "groupID", groupID)
-		for leafName, leaf := range leafs {
-			prefix = leaf.CommonPrefix
-			klog.InfoS("leafSwitches groups", "leafName", leafName, "nodes", leaf.NodeNames.UnsortedList(), "commonPrefix", leaf.CommonPrefix)
+		for leafName, leaf := range leafs.Leafs {
+			klog.InfoS("leafSwitches groups", "leafName", leafName, "nodes", leaf.NodeNames.UnsortedList())
 		}
 
-		hnName := fmt.Sprintf("hn-%s", groupID)
-		if prefix == "" {
-			klog.ErrorS(nil, "Failed to find common prefix for leaf switches", "groupID", groupID)
-			continue
-		}
-
-		klog.InfoS("Begin to create leaf leafHyperNode", "name", hnName)
-		leafHyperNode := util.BuildHyperNode(hnName, 1, []topologyv1alpha1.MemberSpec{
-			{
-				Type:     topologyv1alpha1.MemberTypeNode,
-				Selector: topologyv1alpha1.MemberSelector{RegexMatch: &topologyv1alpha1.RegexMatch{Pattern: prefix}},
-			},
-		})
+		hnName := fmt.Sprintf("leaf-hn-%s", groupID)
+		nodeList := leafs.NodeNames.UnsortedList()
+		klog.InfoS("Begin to create leaf leafHyperNode", "name", hnName, "members", nodeList)
+		members := util.GetMembers(nodeList, topologyv1alpha1.MemberTypeNode)
+		leafHyperNode := util.BuildHyperNode(hnName, 1, members)
 		if err := util.CreateHyperNode(client, leafHyperNode); err != nil {
 			klog.ErrorS(err, "Failed to create leafHyperNode", "name", hnName)
 			continue
@@ -207,15 +212,10 @@ func buildAndCreateHyperNode(client vcclientset.Interface, leafSwitches map[stri
 	}
 
 	// create spine hyperNode
-	members := make([]topologyv1alpha1.MemberSpec, len(leafHyperNodeNames))
-	for i, name := range leafHyperNodeNames {
-		members[i] = topologyv1alpha1.MemberSpec{
-			Type:     topologyv1alpha1.MemberTypeHyperNode,
-			Selector: topologyv1alpha1.MemberSelector{ExactMatch: &topologyv1alpha1.ExactMatch{Name: name}},
-		}
-	}
-
-	spineHyperNode := util.BuildHyperNode("spine-hn", 2, members)
+	hnName := "spine-hn"
+	klog.InfoS("Begin to create spine leafHyperNode", "name", hnName, "members", leafHyperNodeNames)
+	members := util.GetMembers(leafHyperNodeNames, topologyv1alpha1.MemberTypeHyperNode)
+	spineHyperNode := util.BuildHyperNode(hnName, 2, members)
 	if err := util.CreateHyperNode(client, spineHyperNode); err != nil {
 		klog.ErrorS(err, "Failed to create spine hyperNode")
 		return
@@ -277,44 +277,44 @@ func ufmData(ufmAddr, username, password string) ([]UFMInterface, error) {
 func mockUfmData() []UFMInterface {
 	data := []UFMInterface{
 		// group0
-		{SystemName: "node0", PeerNodeName: "leaf0", NodeDescription: "node00-x"},
-		{SystemName: "node0", PeerNodeName: "leaf1", NodeDescription: "node00-x"},
-		{SystemName: "node0", PeerNodeName: "leaf2", NodeDescription: "node00-x"},
-		{SystemName: "node0", PeerNodeName: "leaf3", NodeDescription: "node00-x"},
+		{SystemName: "node0", PeerNodeName: "leaf0", NodeDescription: "node00-x", Description: "Computer IB Port"},
+		{SystemName: "node0", PeerNodeName: "leaf1", NodeDescription: "node00-x", Description: "Computer IB Port"},
+		{SystemName: "node0", PeerNodeName: "leaf2", NodeDescription: "node00-x", Description: "Computer IB Port"},
+		{SystemName: "node0", PeerNodeName: "leaf3", NodeDescription: "node00-x", Description: "Computer IB Port"},
 
-		{SystemName: "node1", PeerNodeName: "leaf0", NodeDescription: "node01-x"},
-		{SystemName: "node1", PeerNodeName: "leaf1", NodeDescription: "node01-x"},
-		{SystemName: "node1", PeerNodeName: "leaf2", NodeDescription: "node01-x"},
-		{SystemName: "node1", PeerNodeName: "leaf3", NodeDescription: "node01-x"},
+		{SystemName: "node1", PeerNodeName: "leaf0", NodeDescription: "node01-x", Description: "Computer IB Port"},
+		{SystemName: "node1", PeerNodeName: "leaf1", NodeDescription: "node01-x", Description: "Computer IB Port"},
+		{SystemName: "node1", PeerNodeName: "leaf2", NodeDescription: "node01-x", Description: "Computer IB Port"},
+		{SystemName: "node1", PeerNodeName: "leaf3", NodeDescription: "node01-x", Description: "Computer IB Port"},
 
-		{SystemName: "node2", PeerNodeName: "leaf0", NodeDescription: "node02-x"},
-		{SystemName: "node2", PeerNodeName: "leaf1", NodeDescription: "node02-x"},
-		{SystemName: "node2", PeerNodeName: "leaf2", NodeDescription: "node02-x"},
-		{SystemName: "node2", PeerNodeName: "leaf3", NodeDescription: "node02-x"},
+		{SystemName: "node2", PeerNodeName: "leaf0", NodeDescription: "node02-x", Description: "Computer IB Port"},
+		{SystemName: "node2", PeerNodeName: "leaf1", NodeDescription: "node02-x", Description: "Computer IB Port"},
+		{SystemName: "node2", PeerNodeName: "leaf2", NodeDescription: "node02-x", Description: "Computer IB Port"},
+		{SystemName: "node2", PeerNodeName: "leaf3", NodeDescription: "node02-x", Description: "Computer IB Port"},
 
-		{SystemName: "node3", PeerNodeName: "leaf0", NodeDescription: "node03-x"},
-		{SystemName: "node3", PeerNodeName: "leaf1", NodeDescription: "node03-x"},
-		{SystemName: "node3", PeerNodeName: "leaf2", NodeDescription: "node03-x"},
-		{SystemName: "node3", PeerNodeName: "leaf3", NodeDescription: "node03-x"},
+		{SystemName: "node3", PeerNodeName: "leaf0", NodeDescription: "node03-x", Description: "Computer IB Port"},
+		{SystemName: "node3", PeerNodeName: "leaf1", NodeDescription: "node03-x", Description: "Computer IB Port"},
+		{SystemName: "node3", PeerNodeName: "leaf2", NodeDescription: "node03-x", Description: "Computer IB Port"},
+		{SystemName: "node3", PeerNodeName: "leaf3", NodeDescription: "node03-x", Description: "Computer IB Port"},
 
 		// group1
-		{SystemName: "node4", PeerNodeName: "leaf4", NodeDescription: "node14-x"},
-		{SystemName: "node4", PeerNodeName: "leaf5", NodeDescription: "node14-x"},
-		{SystemName: "node4", PeerNodeName: "leaf6", NodeDescription: "node14-x"},
+		{SystemName: "node4", PeerNodeName: "leaf4", NodeDescription: "node14-x", Description: "Computer IB Port"},
+		{SystemName: "node4", PeerNodeName: "leaf5", NodeDescription: "node14-x", Description: "Computer IB Port"},
+		{SystemName: "node4", PeerNodeName: "leaf6", NodeDescription: "node14-x", Description: "Computer IB Port"},
 
-		{SystemName: "node5", PeerNodeName: "leaf4", NodeDescription: "node15-x"},
-		{SystemName: "node5", PeerNodeName: "leaf5", NodeDescription: "node15-x"},
-		{SystemName: "node5", PeerNodeName: "leaf6", NodeDescription: "node15-x"},
-		{SystemName: "node5", PeerNodeName: "leaf7", NodeDescription: "node15-x"},
+		{SystemName: "node5", PeerNodeName: "leaf4", NodeDescription: "node15-x", Description: "Computer IB Port"},
+		{SystemName: "node5", PeerNodeName: "leaf5", NodeDescription: "node15-x", Description: "Computer IB Port"},
+		{SystemName: "node5", PeerNodeName: "leaf6", NodeDescription: "node15-x", Description: "Computer IB Port"},
+		{SystemName: "node5", PeerNodeName: "leaf7", NodeDescription: "node15-x", Description: "Computer IB Port"},
 
-		{SystemName: "node6", PeerNodeName: "leaf4", NodeDescription: "node16-x"},
-		{SystemName: "node6", PeerNodeName: "leaf5", NodeDescription: "node16-x"},
-		{SystemName: "node6", PeerNodeName: "leaf6", NodeDescription: "node16-x"},
-		{SystemName: "node6", PeerNodeName: "leaf7", NodeDescription: "node16-x"},
+		{SystemName: "node6", PeerNodeName: "leaf4", NodeDescription: "node16-x", Description: "Computer IB Port"},
+		{SystemName: "node6", PeerNodeName: "leaf5", NodeDescription: "node16-x", Description: "Computer IB Port"},
+		{SystemName: "node6", PeerNodeName: "leaf6", NodeDescription: "node16-x", Description: "Computer IB Port"},
+		{SystemName: "node6", PeerNodeName: "leaf7", NodeDescription: "node16-x", Description: "Computer IB Port"},
 
-		{SystemName: "node7", PeerNodeName: "leaf4", NodeDescription: "node17-x"},
-		{SystemName: "node7", PeerNodeName: "leaf5", NodeDescription: "node17-x"},
-		{SystemName: "node7", PeerNodeName: "leaf6", NodeDescription: "node17-x"},
+		{SystemName: "node7", PeerNodeName: "leaf4", NodeDescription: "node17-x", Description: "Computer IB Port"},
+		{SystemName: "node7", PeerNodeName: "leaf5", NodeDescription: "node17-x", Description: "Computer IB Port"},
+		{SystemName: "node7", PeerNodeName: "leaf6", NodeDescription: "node17-x", Description: "Computer IB Port"},
 	}
 	return data
 }
